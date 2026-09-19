@@ -54,13 +54,15 @@ def _decode_expr(cb: CodebookMode, *, cw_in: str = "cw") -> str:
             half2 dq_h2 = as_type<half2>(dq_r);
             float dq_val = float(dq_h2.x + dq_h2.y);
 """
+    # Sum of the four bytes of dq_cw (CUDA: one __dp4a). Pairwise SWAR
+    # instead of a 4-lane shift/mask/add loop: 2 masks + 2 shifts + 2 adds
+    # vs 12 ops — exact integer sum (max 1020 fits comfortably), and this
+    # decode is the ALU hot spot of every trellis kernel (measured -8% decode
+    # step on M2 Pro with the staged kernel, -5% with simd; bit-identical).
     return f"""
             uint dq_cw = {cw_in} * 0x83DCD12Du;
-            uint dq_sum = 0x6400u;
-            for (uint dq_lane = 0u; dq_lane < 4u; dq_lane++) {{
-                uint ai = (dq_cw >> (8u * dq_lane)) & 0xFFu;
-                dq_sum += ai;
-            }}
+            uint dq_p = (dq_cw & 0x00FF00FFu) + ((dq_cw >> 8u) & 0x00FF00FFu);
+            uint dq_sum = 0x6400u + (dq_p & 0xFFFFu) + (dq_p >> 16u);
             half dq_h = as_type<half>(ushort(dq_sum & 0xFFFFu));
             half dq_k_inv = as_type<half>(ushort(0x1EEEu));
             half dq_k_bias = as_type<half>(ushort(0xC931u));
@@ -1016,8 +1018,35 @@ _M_TILE = 8
 # gathers are latency-bound: 27B 13.9 vs 11.7 tok/s). EXL3_GEMV_LUT=1 opts in.
 _USE_LUT = os.environ.get("EXL3_GEMV_LUT", "0") == "1"
 # simdgroup-cooperative GEMV (v12, ds4 pattern) for M=1; EXL3_GEMV_SIMD=0
-# falls back to the staged v10 kernel.
-_USE_SIMD_GEMV = os.environ.get("EXL3_GEMV_SIMD", "1") != "0"
+# falls back to the staged v10 kernel. The simd kernel wins on M5 Max (where
+# it was developed); on the M1/M2 GPU family (applegpu_g13*/g14*) the staged
+# kernel is markedly faster (M2 Pro, 27B 2-bpw decode step: 541 -> 387 ms), so
+# it is the default there. EXL3_GEMV_SIMD=0/1 always overrides.
+
+
+def _default_simd_gemv() -> bool:
+    try:
+        arch = str(mx.device_info().get("architecture", ""))
+    except Exception:
+        return True
+    return not (arch.startswith("applegpu_g13") or arch.startswith("applegpu_g14"))
+
+
+_USE_SIMD_GEMV = (
+    os.environ["EXL3_GEMV_SIMD"] != "0"
+    if "EXL3_GEMV_SIMD" in os.environ
+    else _default_simd_gemv()
+)
+# Small batches (speculative verify, rows 2-16) are a different story: the
+# simd/devx GEMM re-decodes each tile once per row group and beats the staged
+# kernel everywhere measured (M2 Pro rows=4: 530 vs 917 ms; rows=8: 662 vs
+# 930 ms), so it stays on regardless of the M=1 choice. EXL3_GEMM_SIMD=0 off.
+_USE_SIMD_GEMM = os.environ.get("EXL3_GEMM_SIMD", "1") != "0"
+# Split heuristics (swept on M5 Max: ~8k threadgroups, >=32/64/128 in-tiles
+# per split). Smaller GPUs (M2 Pro: 19 cores) may prefer other values —
+# EXL3_GEM_TARGET_TGS / EXL3_GEM_MIN_SPLIT override for sweeps.
+_GEM_TARGET_TGS = int(os.environ.get("EXL3_GEM_TARGET_TGS", "8192"))
+_GEM_MIN_SPLIT_TILES = int(os.environ.get("EXL3_GEM_MIN_SPLIT", "0"))
 _gemv_simd_kernels: dict[tuple[int, int, int, int], Any] = {}
 
 
@@ -1388,7 +1417,8 @@ def _run_inner_gem(
     # along grid.y (each group re-decodes the trellis — the inherent
     # per-8-rows amortization limit; still far ahead of the staged path).
     devx_ok = _USE_DEVX and 1 < batch <= 16 and k != 7
-    use_simd = _USE_SIMD_GEMV and (batch <= 8 or devx_ok) and k != 7
+    simd_pref = _USE_SIMD_GEMV if batch == 1 else _USE_SIMD_GEMM
+    use_simd = simd_pref and (batch <= 8 or devx_ok) and k != 7
     simd_mt = 1 if batch == 1 else (2 if batch == 2 else (4 if batch <= 4 else 8))
     devx_groups = (batch + simd_mt - 1) // simd_mt if devx_ok else 1
 
@@ -1405,9 +1435,11 @@ def _run_inner_gem(
     min_split_tiles = (128 if simd_mt == 1 else 64) if use_simd else 32
     if use_simd and simd_mt > 1 and out_tiles <= 8:
         min_split_tiles = 8
+    if _GEM_MIN_SPLIT_TILES:
+        min_split_tiles = _GEM_MIN_SPLIT_TILES
     n_splits = 1
     while (
-        out_tiles * m_groups * n_splits < 8192
+        out_tiles * m_groups * n_splits < _GEM_TARGET_TGS
         and in_tiles // (n_splits * 2) >= min_split_tiles
     ):
         n_splits *= 2
