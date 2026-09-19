@@ -929,7 +929,7 @@ def _gem_source(k: int, cb: CodebookMode, mt: int, use_lut: bool) -> str:
 
     // TB in-tiles per barrier iteration: TB independent loads + decode chains
     // per thread keep ~TB x more bytes in flight and amortize the barrier.
-    #define TB 4u
+    #define TB {_STAGED_TB}u
     threadgroup uint tg_words[2][TB][PACKED_U32];
     threadgroup float tg_x[2][TB][MT * 16u];
     threadgroup float tg_w[256];
@@ -1013,7 +1013,149 @@ def _gem_source(k: int, cb: CodebookMode, mt: int, use_lut: bool) -> str:
 """
 
 
+def _gem_xt_source(k: int, cb: CodebookMode, mt: int) -> str:
+    """v10 staged kernel for small batches with DEVICE-DIRECT x loads.
+
+    Same trellis staging / decode / register accumulation as ``_gem_source``,
+    but x is laid out transposed as (n_sub, in_features, MT) fp16 so each
+    thread's two fixed rows fetch all MT batch values as two ``half4`` pairs
+    from L1 instead of 2*MT scalar threadgroup loads (+ the staging loop and
+    its barrier). On M2 Pro the v10 kernel is the fastest M=1 kernel but its
+    MT=8 variant paid ~2.4x for exactly that threadgroup traffic; this brings
+    the 8-row verify step (DFlash2 block) close to the 1-row cost.
+    """
+    packed_u32 = k * 256 // 32
+    decode = _decode_expr(cb, cw_in="cw")
+    assert mt in (4, 8)
+    return f"""
+#define PACKED_U32 {packed_u32}
+#define K_BITS {k}
+#define MT {mt}u
+
+    uint tn = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint in_tiles = dims[0];
+    uint out_tiles = dims[1];
+    uint batch = dims[2];
+    uint n_splits = dims[3];
+    uint n_sub = dims[4];
+    uint mt_total = dims[5];            // padded row count of the transposed x
+    uint in_features = in_tiles * 16u;
+    uint out_features = out_tiles * 16u;
+    uint m0 = threadgroup_position_in_grid.y * MT;
+    uint sub = (n_sub > 1u) ? tile_sub[tn] : 0u;
+
+    uint split = threadgroup_position_in_grid.z;
+    uint tiles_per_split = (in_tiles + n_splits - 1u) / n_splits;
+    uint tk_begin = split * tiles_per_split;
+    uint tk_end = min(tk_begin + tiles_per_split, in_tiles);
+
+    #define TB {_XT_TB}u
+    #define MQ (MT / 4u)
+    threadgroup uint tg_words[2][TB][PACKED_U32];
+    threadgroup float tg_w[256];
+
+    uint pos0 = perm[tid * 2u];
+    uint pos1 = perm[tid * 2u + 1u];
+    uint row0 = pos0 >> 4u;
+    uint row1 = pos1 >> 4u;
+
+    int b0 = int(tid) * 2 * K_BITS + K_BITS - 16 + 256 * K_BITS;
+    int b2 = b0 + K_BITS + 16;
+    uint i0 = uint(b0 / 32) % PACKED_U32;
+    uint i1 = uint((b2 - 1) / 32) % PACKED_U32;
+    uint s1 = uint(((b2 - 1) / 32 + 1) * 32 - b2);
+
+    // x rows for this thread: fp16, transposed (in_features, mt_total); the MT
+    // batch values of a row are MQ half4 loads straight from L1. (Staging x in
+    // threadgroup memory — as half4, or as float4 converted once — measured
+    // slower on M2 Pro: 693 / 786 ms vs 676 ms for the 8-row step.)
+    const device half* xrow0 = xt + (sub * in_features + row0) * mt_total + m0;
+    const device half* xrow1 = xt + (sub * in_features + row1) * mt_total + m0;
+
+    float4 acc0[MQ];
+    float4 acc1[MQ];
+    for (uint q = 0u; q < MQ; q++) {{
+        acc0[q] = float4(0.0f);
+        acc1[q] = float4(0.0f);
+    }}
+
+    for (uint tk = tk_begin; tk < tk_end; tk += TB) {{
+        uint buf = (tk / TB) & 1u;
+        if (tid < PACKED_U32) {{
+            for (uint t = 0u; t < TB; t++) {{
+                if (tk + t < tk_end) {{
+                    tg_words[buf][t][tid] =
+                        trellis[((tk + t) * out_tiles + tn) * PACKED_U32 + tid];
+                }}
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint t = 0u; t < TB; t++) {{
+            if (tk + t >= tk_end) {{
+                break;
+            }}
+            ulong merged = ((ulong)tg_words[buf][t][i0] << 32) | (ulong)tg_words[buf][t][i1];
+            uint w1 = uint(merged >> s1);
+            uint w0 = (w1 >> K_BITS) & 0xFFFFu;
+            w1 &= 0xFFFFu;
+            float dq0;
+            float dq1;
+            {{
+                uint cw = w0;
+{decode}
+                dq0 = dq_val;
+            }}
+            {{
+                uint cw = w1;
+{decode}
+                dq1 = dq_val;
+            }}
+            const device half4* x0 = (const device half4*)(xrow0 + (tk + t) * 16u * mt_total);
+            const device half4* x1 = (const device half4*)(xrow1 + (tk + t) * 16u * mt_total);
+            for (uint q = 0u; q < MQ; q++) {{
+                acc0[q] = fma(float4(x0[q]), dq0, acc0[q]);
+                acc1[q] = fma(float4(x1[q]), dq1, acc1[q]);
+            }}
+        }}
+    }}
+
+    for (uint mm = 0u; mm < MT; mm++) {{
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tg_w[pos0] = acc0[mm / 4u][mm % 4u];
+        tg_w[pos1] = acc1[mm / 4u][mm % 4u];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 16u && m0 + mm < batch) {{
+            float s = 0.0f;
+            for (uint r = 0u; r < 16u; r++) {{
+                s += tg_w[r * 16u + tid];
+            }}
+            out[((m0 + mm) * n_splits + split) * out_features + tn * 16u + tid] = s;
+        }}
+    }}
+"""
+
+
+_gem_xt_kernels: dict[tuple[int, int, int], Callable[..., Any]] = {}
+
+
+def _gem_xt_kernel(k: int, cb: CodebookMode, mt: int) -> Callable[..., Any]:
+    key = (k, int(cb), mt)
+    if key not in _gem_xt_kernels:
+        _gem_xt_kernels[key] = mx.fast.metal_kernel(
+            name=f"exl3_gem_xt_k{k}_cb{int(cb)}_mt{mt}_tb{_XT_TB}_v5",
+            input_names=["xt", "trellis", "perm", "tile_sub", "dims"],
+            output_names=["out"],
+            source=_gem_xt_source(k, cb, mt),
+        )
+    return _gem_xt_kernels[key]
+
+
 _M_TILE = 8
+# in-tiles per barrier in the staged kernels (sweep knob)
+_STAGED_TB = int(os.environ.get("EXL3_STAGED_TB", "8"))  # M=1 v10: 8 best on M2 Pro (4: +3%, 16: +12%)
+_XT_TB = int(os.environ.get("EXL3_XT_TB", "4"))  # rows 2-16 xt kernel: 4 best (8: +5% at rows=4)
 # Computed 3INST decode beats the 128 KB LUT end-to-end on M5 Max (random
 # gathers are latency-bound: 27B 13.9 vs 11.7 tok/s). EXL3_GEMV_LUT=1 opts in.
 _USE_LUT = os.environ.get("EXL3_GEMV_LUT", "0") == "1"
@@ -1042,6 +1184,14 @@ _USE_SIMD_GEMV = (
 # kernel everywhere measured (M2 Pro rows=4: 530 vs 917 ms; rows=8: 662 vs
 # 930 ms), so it stays on regardless of the M=1 choice. EXL3_GEMM_SIMD=0 off.
 _USE_SIMD_GEMM = os.environ.get("EXL3_GEMM_SIMD", "1") != "0"
+# Staged kernel with transposed device-direct x for rows 2-16 (_gem_xt_source).
+# Default on where the staged M=1 kernel is the fast one (M1/M2 family);
+# EXL3_GEMM_XT=0/1 overrides.
+_USE_XT_GEMM = (
+    os.environ["EXL3_GEMM_XT"] != "0"
+    if "EXL3_GEMM_XT" in os.environ
+    else not _default_simd_gemv()
+)
 # Split heuristics (swept on M5 Max: ~8k threadgroups, >=32/64/128 in-tiles
 # per split). Smaller GPUs (M2 Pro: 19 cores) may prefer other values —
 # EXL3_GEM_TARGET_TGS / EXL3_GEM_MIN_SPLIT override for sweeps.
@@ -1358,7 +1508,7 @@ def _gem_kernel(k: int, cb: CodebookMode, mt: int, use_lut: bool) -> Callable[..
     key = (k, int(cb), mt, use_lut)
     if key not in _gem_kernels:
         _gem_kernels[key] = mx.fast.metal_kernel(
-            name=f"exl3_gem_k{k}_cb{int(cb)}_mt{mt}_lut{int(use_lut)}_v11",
+            name=f"exl3_gem_k{k}_cb{int(cb)}_mt{mt}_lut{int(use_lut)}_tb{_STAGED_TB}_v11",
             input_names=["xh", "trellis", "perm", "tile_sub", "lut", "dims"],
             output_names=["out"],
             source=_gem_source(k, cb, mt, use_lut),
@@ -1416,6 +1566,41 @@ def _run_inner_gem(
     # The v20 devx kernel additionally covers rows 9-16 with TWO row groups
     # along grid.y (each group re-decodes the trellis — the inherent
     # per-8-rows amortization limit; still far ahead of the staged path).
+    if _USE_XT_GEMM and 1 < batch <= 16:
+        # staged kernel + transposed device-direct x (see _gem_xt_source)
+        xt_mt = 4 if batch <= 4 else 8
+        groups = (batch + xt_mt - 1) // xt_mt
+        mt_total = xt_mt * groups
+        x3 = xh.astype(mx.float16)
+        if x3.ndim == 2:
+            x3 = x3[:, None, :]
+        xt = x3.transpose(1, 2, 0)
+        if batch < mt_total:
+            xt = mx.pad(xt, [(0, 0), (0, 0), (0, mt_total - batch)])
+        xin = mx.contiguous(xt).reshape(-1)
+        n_splits = 1
+        while out_tiles * groups * n_splits < _GEM_TARGET_TGS and in_tiles // (n_splits * 2) >= 32:
+            n_splits *= 2
+        dims = mx.array([in_tiles, out_tiles, batch, n_splits, n_sub, mt_total], dtype=mx.uint32)
+        out = _gem_xt_kernel(k, cb, xt_mt)(
+            inputs=[
+                xin,
+                trellis_u32,
+                _fwd_perm_u32(),
+                tile_sub if tile_sub is not None else _dummy_sub(),
+                dims,
+            ],
+            template=[("T", mx.float32)],
+            grid=(out_tiles * _GEM_THREADS, groups, n_splits),
+            threadgroup=(_GEM_THREADS, 1, 1),
+            output_shapes=[(mt_total * n_splits * out_features,)],
+            output_dtypes=[mx.float32],
+        )[0]
+        out = out.reshape(mt_total, n_splits, out_features)
+        if n_splits > 1:
+            out = out.sum(axis=1)
+        return out.reshape(mt_total, out_features)[:batch]
+
     devx_ok = _USE_DEVX and 1 < batch <= 16 and k != 7
     simd_pref = _USE_SIMD_GEMV if batch == 1 else _USE_SIMD_GEMM
     use_simd = simd_pref and (batch <= 8 or devx_ok) and k != 7
