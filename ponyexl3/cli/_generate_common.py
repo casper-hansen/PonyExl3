@@ -90,7 +90,19 @@ def add_generate_arguments(
         help="quantize the draft side (verify-gated; output unchanged)",
     )
     ap.add_argument("--eagle3", default=None, help="EAGLE-3 draft head directory")
-    ap.add_argument("--dflash", default=None, help="DFlash block-drafter directory")
+    ap.add_argument("--dflash", default=None, help="DFlash (v1) block-drafter directory")
+    ap.add_argument(
+        "--dflash2",
+        default=None,
+        help="DFlash2 drafter directory (e.g. z-lab/Qwen3.8-27B-DFlash2 snapshot); "
+        "block-8 diffusion drafts, verify-gated — takes precedence over other drafters",
+    )
+    ap.add_argument(
+        "--dflash2-bits",
+        default="4",
+        choices=("4", "8", "16"),
+        help="DFlash2 body precision (4/8 = affine requant, cached; 16 = bf16 as shipped)",
+    )
     ap.add_argument(
         "--dflash-quant",
         default="w8",
@@ -152,6 +164,8 @@ def require_metal() -> None:
 
 def warn_speculative_flags(args: argparse.Namespace) -> None:
     spec = []
+    if getattr(args, "dflash2", None):
+        spec.append("--dflash2")
     if args.dflash:
         spec.append("--dflash")
     if args.eagle3:
@@ -161,7 +175,7 @@ def warn_speculative_flags(args: argparse.Namespace) -> None:
     if len(spec) > 1:
         print(
             f"[warn] multiple spec flags ({', '.join(spec)}); "
-            "precedence: dflash > eagle3 > mtp",
+            "precedence: dflash2 > dflash > eagle3 > mtp",
             file=sys.stderr,
         )
     if args.lookup and spec:
@@ -236,6 +250,7 @@ class GenerateStack:
     dflash: DraftModule | None
     extra_eos: tuple[int, ...]
     draft: int
+    dflash2: DraftModule | None = None
 
 
 def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
@@ -256,6 +271,23 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
             f"[load] {time.perf_counter() - tic:.1f}s engine={args.engine} — {describe(model)}",
             file=sys.stderr,
         )
+
+    dflash2: DraftModule | None = None
+    if getattr(args, "dflash2", None):
+        from ponyexl3.mlx.dflash2 import load_dflash2
+
+        bits = None if args.dflash2_bits == "16" else int(args.dflash2_bits)
+        dflash2 = load_dflash2(args.dflash2, bits=bits, verbose=not args.quiet)
+        if not args.quiet:
+            print(
+                f"[dflash2] drafter loaded (block {dflash2.config.block_size}, "
+                f"{'bf16' if bits is None else f'w{bits}'} body) — speculative decoding on",
+                file=sys.stderr,
+            )
+        # the other drafters are mutually exclusive with dflash2
+        args.dflash = None
+        args.eagle3 = None
+        args.mtp = "off"
 
     dflash: DraftModule | None = None
     draft = args.draft
@@ -361,6 +393,7 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
         dflash=dflash,
         extra_eos=extra_eos,
         draft=draft,
+        dflash2=dflash2,
     )
 
 

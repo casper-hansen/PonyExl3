@@ -1043,6 +1043,7 @@ def generate_text(
     dflash: DraftModule | None = None,
     max_context: int | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
+    dflash2: DraftModule | None = None,
 ) -> tuple[str, GenStats]:
     """Encode, generate, and detokenize. ``on_segment`` streams text chunks.
     With an ``mtp`` draft module and greedy sampling, uses speculative
@@ -1068,6 +1069,7 @@ def generate_text(
 
     using_spec = bool(
         dflash is not None
+        or dflash2 is not None
         or eagle3 is not None
         or mtp is not None
         or (lookup and temp <= 0.0)
@@ -1089,7 +1091,20 @@ def generate_text(
         eos_ids.add(tokenizer.eos_token_id)
 
     stats = GenStats()
-    if dflash is not None:
+    if dflash2 is not None:
+        from ponyexl3.mlx.dflash2 import dflash2_stream_generate
+
+        gen = dflash2_stream_generate(
+            model,
+            dflash2,
+            tokenizer,
+            prompt_ids,
+            max_tokens=max_tokens,
+            temp=temp,
+            prefill_chunk=prefill_chunk,
+            stats=stats,
+        )
+    elif dflash is not None:
         gen = dflash_stream_generate(
             model,
             dflash,

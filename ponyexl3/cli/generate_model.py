@@ -45,6 +45,7 @@ def main() -> int:
             lookup=args.lookup,
             eagle3=stack.eagle3,
             dflash=stack.dflash,
+            dflash2=stack.dflash2,
             max_context=max_position_embeddings(stack.config),
             chat_template_kwargs=chat_template_kwargs_from_args(args),
         )
