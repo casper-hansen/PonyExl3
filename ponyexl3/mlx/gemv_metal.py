@@ -1166,12 +1166,17 @@ _USE_LUT = os.environ.get("EXL3_GEMV_LUT", "0") == "1"
 # it is the default there. EXL3_GEMV_SIMD=0/1 always overrides.
 
 
-def _default_simd_gemv() -> bool:
+def is_m1_m2_gpu() -> bool:
+    """Apple GPU family g13 (M1) / g14 (M2): where the M5-tuned defaults lose."""
     try:
         arch = str(mx.device_info().get("architecture", ""))
     except Exception:
-        return True
-    return not (arch.startswith("applegpu_g13") or arch.startswith("applegpu_g14"))
+        return False
+    return arch.startswith("applegpu_g13") or arch.startswith("applegpu_g14")
+
+
+def _default_simd_gemv() -> bool:
+    return not is_m1_m2_gpu()
 
 
 _USE_SIMD_GEMV = (

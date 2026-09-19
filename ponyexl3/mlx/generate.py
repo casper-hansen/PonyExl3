@@ -91,13 +91,15 @@ class GenStats:
     spec_cycles: int = 0
     spec_drafted: int = 0
     spec_accepted: int = 0
+    prompt_reused: int = 0  # prompt tokens restored from the prefix cache
 
     def summary(self) -> str:
         pf = self.prompt_tokens / self.prefill_s if self.prefill_s else 0.0
         dc = self.gen_tokens / self.decode_s if self.decode_s else 0.0
         s = (
-            f"prompt {self.prompt_tokens} tok in {self.prefill_s:.2f}s ({pf:.1f} tok/s) | "
-            f"gen {self.gen_tokens} tok in {self.decode_s:.2f}s ({dc:.1f} tok/s) | "
+            f"prompt {self.prompt_tokens} tok in {self.prefill_s:.2f}s ({pf:.1f} tok/s"
+            + (f", {self.prompt_reused} reused from prefix cache" if self.prompt_reused else "")
+            + f") | gen {self.gen_tokens} tok in {self.decode_s:.2f}s ({dc:.1f} tok/s) | "
             f"stop: {self.finish_reason}"
         )
         if self.spec_cycles:
@@ -124,24 +126,34 @@ def stream_generate(
     prefill_chunk: int = 2048,
     eos_ids: set[int] | frozenset[int] = frozenset(),
     stats: GenStats | None = None,
+    prefix_cache: Any | None = None,
 ) -> Iterator[int]:
-    """Yield generated token ids one at a time from wrapped or bare mlx_lm models."""
+    """Yield generated token ids one at a time from wrapped or bare mlx_lm models.
+
+    With ``prefix_cache`` (:class:`ponyexl3.mlx.prefix_cache.PrefixCache`) the
+    prompt's longest snapshotted prefix is restored instead of re-prefilled,
+    and the state after generation is snapshotted for the next turn.
+    """
     validate_generation_params(
         prompt_ids,
         max_tokens=max_tokens,
         prefill_chunk=prefill_chunk,
     )
     lm, inner, lm_head = _lm_parts(model)
-    cache = lm.make_cache()
     stats = stats if stats is not None else GenStats()
     stats.prompt_tokens = len(prompt_ids)
 
     tic = time.perf_counter()
-    toks = mx.array([prompt_ids])
-    h = _prefill_hidden(inner, toks, cache, chunk=prefill_chunk)
-    mx.eval(h)
-    logits = lm_head(h[:, -1:, :])
-    mx.eval(logits)
+    if prefix_cache is not None:
+        cache, logits, n_reused = prefix_cache.prefill(prompt_ids, chunk=prefill_chunk)
+        stats.prompt_reused = n_reused
+    else:
+        cache = lm.make_cache()
+        toks = mx.array([prompt_ids])
+        h = _prefill_hidden(inner, toks, cache, chunk=prefill_chunk)
+        mx.eval(h)
+        logits = lm_head(h[:, -1:, :])
+        mx.eval(logits)
     stats.prefill_s = time.perf_counter() - tic
 
     def _step(prev_y: mx.array) -> mx.array:
@@ -153,11 +165,14 @@ def stream_generate(
     tic = time.perf_counter()
     y = _sample(logits[:, -1, :], temp)
     mx.async_eval(y)
+    generated: list[int] = []
+    next_logits = logits
     for _ in range(max_tokens):
         next_logits = _step(y)
         next_y = _sample(next_logits[:, -1, :], temp)
         mx.async_eval(next_y)
         tok = int(y.item())
+        generated.append(tok)
         if tok in eos_ids:
             stats.finish_reason = "stop"
             break
@@ -165,6 +180,10 @@ def stream_generate(
         yield tok
         y = next_y
     stats.decode_s = time.perf_counter() - tic
+    if prefix_cache is not None and generated:
+        # every yielded token (incl. a terminal EOS) has been fed; the cache
+        # holds prompt+generated and next_logits are for the following token
+        prefix_cache.snapshot(prompt_ids + generated, cache, next_logits)
 
 
 def _snapshot_recurrent(cache: list[Any]) -> list[Any]:
@@ -1044,6 +1063,7 @@ def generate_text(
     max_context: int | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     dflash2: DraftModule | None = None,
+    prefix_cache: Any | None = None,
 ) -> tuple[str, GenStats]:
     """Encode, generate, and detokenize. ``on_segment`` streams text chunks.
     With an ``mtp`` draft module and greedy sampling, uses speculative
@@ -1159,6 +1179,7 @@ def generate_text(
             prefill_chunk=prefill_chunk,
             eos_ids=eos_ids,
             stats=stats,
+            prefix_cache=prefix_cache,
         )
     detok = tokenizer.detokenizer
     detok.reset()

@@ -17,6 +17,7 @@ import mlx.nn as nn
 
 from ponyexl3.mlx.gemv_metal import (
     decode_full_mlx,
+    is_m1_m2_gpu,
     inner_gemm_mlx,
     inner_gemv_had_mlx,
     inner_gemv_mlx,
@@ -47,7 +48,12 @@ HUGE_WEIGHT_BYTES = 64 * 1024 * 1024
 # Above this batch, decode-once (v13) + native matmul beats the fused GEMM,
 # which re-reads the trellis once per M_TILE (8) rows (measured ~64-row
 # crossover on M5 Max for 27B-scale layers).
-FUSED_GEMM_ROW_LIMIT = 64
+# M1/M2 GPUs: the fused GEMM re-decodes per 8-row group and loses to
+# decode-once+matmul much earlier (M2 Pro, 27B: rows=22 2796 vs 1611 ms,
+# rows=48 5518 vs 2078 ms; rows=12 still wins 1113 vs 1417). EXL3_FUSED_GEMM_ROWS overrides.
+FUSED_GEMM_ROW_LIMIT = int(
+    os.environ.get("EXL3_FUSED_GEMM_ROWS", "16" if is_m1_m2_gpu() else "64")
+)
 # Don't materialize transient fp16 W beyond this (lm_head-scale layers keep
 # the striped path).
 DECODE_FULL_MAX_BYTES = 1536 * 1024 * 1024
