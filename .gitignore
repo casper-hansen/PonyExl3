@@ -32,3 +32,7 @@ ponyexl3/reference/*.verify.txt
 
 # Internal working ledger (not published)
 docs/current_stage.md
+
+# cross-platform parity bundles (model-derived, large)
+parity/*_cuda.npz
+parity/*_mlx.npz

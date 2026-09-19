@@ -7,9 +7,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ponyexl3.types import ExLlamaModel
-
 import numpy as np
+
+try:
+    from ponyexl3.types import ExLlamaModel
+except ImportError:  # CUDA host with only this directory copied over (no ponyexl3 package)
+    ExLlamaModel = Any
 
 DEFAULT_ATTN_MODE = "flash_attn_nc"
 
