@@ -13,6 +13,7 @@ import sys
 
 from ponyexl3.cli._generate_common import (
     add_generate_arguments,
+    chat_template_kwargs_from_args,
     load_generate_stack,
     validate_generate_cli_args,
 )
@@ -45,6 +46,7 @@ def main() -> int:
             eagle3=stack.eagle3,
             dflash=stack.dflash,
             max_context=max_position_embeddings(stack.config),
+            chat_template_kwargs=chat_template_kwargs_from_args(args),
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc

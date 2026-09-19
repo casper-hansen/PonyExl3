@@ -151,6 +151,11 @@ def layer_runtime_mlx(layer: EXL3Layer) -> EXL3LayerRuntime:
     key = _layer_key(layer)
     if key in _runtime_cache:
         return _runtime_cache[key]
+    if layer.trellis is None:
+        raise RuntimeError(
+            f"{layer.key}: host trellis released and no pinned device runtime "
+            "(clear_layer_caches() after release_source()?)"
+        )
 
     suh_np = unpack_signs_or_pass(layer.suh)
     svh_np = unpack_signs_or_pass(layer.svh)
@@ -182,7 +187,8 @@ def inner_weight_mlx(layer: EXL3Layer, *, use_cache: bool = True) -> mx.array:
         return _inner_cache[key]
     rt = layer_runtime_mlx(layer)
     w = reconstruct_inner_mlx(
-        layer.trellis,
+        # host copy may already be released — the device runtime is canonical
+        layer.trellis if layer.trellis is not None else rt.trellis,
         rt.k,
         mcg=layer.mcg,
         mul1=layer.mul1,
@@ -239,6 +245,17 @@ def warm_layer_mlx(
             n1 = min(n0 + cols, layer.out_features)
             stripe_weight_mlx(layer, n0, n1 - n0)
     return rt
+
+
+def drop_layer_runtime(layer: EXL3Layer) -> None:
+    """Forget one layer's cached runtime / decoded weights (e.g. a sibling
+    that was just folded into a FusedEXL3Group) without touching the pins of
+    every other layer the way :func:`clear_layer_caches` does."""
+    key = _layer_key(layer)
+    _runtime_cache.pop(key, None)
+    _inner_cache.pop(key, None)
+    for k in [k for k in _stripe_cache if k[0] == key]:
+        _stripe_cache.pop(k, None)
 
 
 def clear_layer_caches() -> None:

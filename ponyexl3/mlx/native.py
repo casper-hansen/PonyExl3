@@ -43,29 +43,53 @@ from ponyexl3.types import MlxLmModel
 
 # One output-column stripe of fp32 intermediate at a time (multiple of 128).
 PUBLIC_CHUNK_COLS = 8192
+# Row block of the identity activation fed through the fold. The fold block
+# runs an fp32 Hadamard over its input, so a full (in x in) identity costs
+# 4*in^2 bytes transiently — 1.2 GB at in=17408 (a 27B down_proj), ~4.5 GB
+# peak with the surrounding intermediates. Rows are independent, so block it.
+PUBLIC_CHUNK_ROWS = 2048
 HUGE_WEIGHT_BYTES = 64 * 1024 * 1024
 
 
-def public_weight_chunks(layer: EXL3Layer, *, chunk_cols: int = PUBLIC_CHUNK_COLS):
+def public_weight_chunks(
+    layer: EXL3Layer,
+    *,
+    chunk_cols: int = PUBLIC_CHUNK_COLS,
+    chunk_rows: int = PUBLIC_CHUNK_ROWS,
+):
     """Yield ``W_pub[:, n0:n1]`` fp16 chunks with all transforms folded in.
 
     Uses the same ``prefill_matmul_mlx`` block as the exact runtime, fed with an
     identity activation, so the folded weights match runtime numerics exactly.
+    The identity is fed in row blocks (``chunk_rows``, a multiple of 128) to
+    bound the transient; the fold is row-separable so the result is unchanged.
     """
     if chunk_cols % 128 != 0:
         raise ValueError("chunk_cols must be a multiple of 128")
+    if chunk_rows % 128 != 0:
+        raise ValueError("chunk_rows must be a multiple of 128")
     rt = layer_runtime_mlx(layer)
-    eye = mx.eye(layer.in_features, dtype=mx.float16)
     huge = layer.in_features * layer.out_features * 2 > HUGE_WEIGHT_BYTES
+    # decoded once for the duration of this generator; not left in the
+    # process-wide inner cache (a one-shot fold has no later reader for it)
+    w_full = None if huge else inner_weight_mlx(layer, use_cache=False)
 
     for n0 in range(0, layer.out_features, chunk_cols):
         n = min(chunk_cols, layer.out_features - n0)
-        if huge:
+        if w_full is None:
             w_inner = stripe_weight_mlx(layer, n0, n, use_cache=False)
         else:
-            w_inner = inner_weight_mlx(layer)[:, n0 : n0 + n]
+            w_inner = w_full[:, n0 : n0 + n]
         svh = None if rt.svh is None else rt.svh[n0 : n0 + n]
-        chunk = prefill_matmul_mlx(eye, w_inner, rt.suh, svh, use_compile=False)
+        rows = []
+        for r0 in range(0, layer.in_features, chunk_rows):
+            r = min(chunk_rows, layer.in_features - r0)
+            # rows r0..r0+r of the identity: ones on the r0-th super-diagonal
+            eye_rows = mx.eye(r, layer.in_features, k=r0, dtype=mx.float16)
+            part = prefill_matmul_mlx(eye_rows, w_inner, rt.suh, svh, use_compile=False)
+            mx.eval(part)
+            rows.append(part)
+        chunk = rows[0] if len(rows) == 1 else mx.concatenate(rows, axis=0)
         mx.eval(chunk)
         yield chunk
 

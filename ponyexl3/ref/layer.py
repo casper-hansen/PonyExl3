@@ -17,7 +17,9 @@ class EXL3Layer:
     in_features: int
     out_features: int
     k: int
-    trellis: np.ndarray  # (in_tiles, out_tiles, packed_size) uint16
+    # (in_tiles, out_tiles, packed_size) uint16; ``None`` once the host copy
+    # has been released to the device runtime (EXL3Linear.release_source)
+    trellis: np.ndarray | None
     suh: np.ndarray | None = None  # float16 (in,) or packed int16 (in//16,)
     svh: np.ndarray | None = None
     bias: np.ndarray | None = None
@@ -37,6 +39,8 @@ class EXL3Layer:
         out_tiles = self.out_features // 16
         if self.in_features % 16 != 0 or self.out_features % 16 != 0:
             raise ValueError("in/out features must be multiples of 16")
+        if self.trellis is None:
+            return  # host source released; shape was validated before upload
         if self.trellis.shape != (in_tiles, out_tiles, self.packed_tile_size):
             raise ValueError(
                 f"trellis shape {self.trellis.shape} != "

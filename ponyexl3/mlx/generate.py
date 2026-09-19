@@ -66,10 +66,17 @@ def _prefill_hidden(
     *,
     chunk: int,
 ) -> mx.array:
-    """Run chunked prefill; ``toks`` must have sequence length >= 1."""
+    """Run chunked prefill; ``toks`` must have sequence length >= 1.
+
+    Each chunk is evaluated before the next is built, so the transient
+    (activations + fp16 decode scratch) is bounded by one chunk rather than
+    the whole prompt's lazy graph. Measured cost-neutral on prefill
+    throughput (the chunks are large enough to keep the GPU fed).
+    """
     end = min(chunk, toks.shape[1])
     h = model(toks[:, :end], cache=cache)
     for s0 in range(chunk, toks.shape[1], chunk):
+        mx.eval(h)
         h = model(toks[:, s0 : s0 + chunk], cache=cache)
     return h
 
@@ -1035,6 +1042,7 @@ def generate_text(
     eagle3: DraftModule | None = None,
     dflash: DraftModule | None = None,
     max_context: int | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> tuple[str, GenStats]:
     """Encode, generate, and detokenize. ``on_segment`` streams text chunks.
     With an ``mtp`` draft module and greedy sampling, uses speculative
@@ -1042,12 +1050,15 @@ def generate_text(
     speculation (both verified — output identical to plain greedy).
 
     Pass ``prompt_ids`` to skip string encoding (used by throughput benches
-    that need an exact prefill length)."""
+    that need an exact prefill length). ``chat_template_kwargs`` are forwarded
+    to ``apply_chat_template`` (e.g. ``enable_thinking``, ``reasoning_effort``
+    for Qwen3.x templates)."""
     if prompt_ids is None:
         if use_chat_template and getattr(tokenizer, "chat_template", None):
             prompt_ids = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
+                **(chat_template_kwargs or {}),
             )
         else:
             prompt_ids = tokenizer.encode(prompt)

@@ -47,8 +47,25 @@ def add_generate_arguments(
     if with_max_tokens:
         ap.add_argument("-n", "--max-tokens", type=int, default=256)
     ap.add_argument("--temp", type=float, default=0.0)
-    ap.add_argument("--prefill-chunk", type=int, default=2048)
+    ap.add_argument(
+        "--prefill-chunk",
+        type=int,
+        default=None,
+        help="tokens per prefill forward (default: 2048, or 512 when the GPU "
+        "working set is under 32 GB — the 2048 transient thrashes 16 GB Macs)",
+    )
     ap.add_argument("--raw", action="store_true", help="skip the chat template")
+    ap.add_argument(
+        "--no-think",
+        action="store_true",
+        help="chat template: enable_thinking=False (Qwen3.x) — skip the reasoning trace",
+    )
+    ap.add_argument(
+        "--reasoning-effort",
+        default=None,
+        choices=("low", "medium", "xhigh"),
+        help="chat template: reasoning_effort for thinking models (Qwen3.8 default xhigh)",
+    )
     ap.add_argument(
         "--engine",
         default="exl3",
@@ -82,6 +99,34 @@ def add_generate_arguments(
     )
     ap.add_argument("--no-warm", action="store_true", help="skip weight-cache warmup")
     ap.add_argument("-q", "--quiet", action="store_true", help="suppress load progress")
+
+
+def default_prefill_chunk() -> int:
+    """2048 on big-memory Macs; 512 when the GPU's recommended working set is
+    under 32 GB. Measured on a 16 GB M2 Pro with a 27B 2-bpw checkpoint at a
+    2.6k-token prompt: 2048 → 29 tok/s prefill and 0.4 tok/s decode (the
+    prefill transient pushes the weights out and the first decode steps page
+    them back); 512 → 66 tok/s prefill, 2.5 tok/s decode, same output."""
+    try:
+        import mlx.core as mx
+
+        ws = int(mx.device_info().get("max_recommended_working_set_size", 0))
+    except Exception:
+        ws = 0
+    if 0 < ws < 32 * 1024**3:
+        return 512
+    return 2048
+
+
+def chat_template_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    """``--no-think`` / ``--reasoning-effort`` → ``apply_chat_template`` kwargs."""
+    kw: dict[str, Any] = {}
+    if getattr(args, "no_think", False):
+        kw["enable_thinking"] = False
+    effort = getattr(args, "reasoning_effort", None)
+    if effort:
+        kw["reasoning_effort"] = effort
+    return kw
 
 
 def validate_exl3_model_dir(model_dir: str | Path) -> Path:
@@ -133,6 +178,8 @@ def validate_generate_cli_args(
 ) -> None:
     validate_exl3_model_dir(args.model)
     require_metal()
+    if args.prefill_chunk is None:
+        args.prefill_chunk = default_prefill_chunk()
     if args.prefill_chunk <= 0:
         raise SystemExit("--prefill-chunk must be positive")
     if args.draft <= 0:

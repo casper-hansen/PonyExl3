@@ -395,11 +395,12 @@ def fuse_exl3_siblings(model: MlxLmModel, *, model_type: str = "") -> int:
 
     # The fused group owns an independent concatenated trellis, so each
     # member's per-layer runtime becomes dead once it is replaced. Release
-    # those buffers as we go (every few groups) so they don't pile up
-    # alongside the accumulating fused buffers — that coexistence is the
-    # dominant load-time memory spike on this path (measured ~21 GB device
-    # peak collapsing to ~15 GB resident once the members are freed).
-    from ponyexl3.mlx.layer_state import clear_layer_caches
+    # those buffers as we go so they don't pile up alongside the accumulating
+    # fused buffers — that coexistence is the dominant load-time memory spike
+    # on this path (measured ~21 GB device peak collapsing to ~15 GB resident
+    # once the members are freed). Only the members' entries are dropped: the
+    # other layers' runtimes are pinned (their host source is already gone).
+    from ponyexl3.mlx.layer_state import drop_layer_runtime
 
     n = 0
     for layer in model.layers:
@@ -427,7 +428,8 @@ def fuse_exl3_siblings(model: MlxLmModel, *, model_type: str = "") -> int:
             n += 1
             # drop the just-replaced members' cached runtimes immediately so
             # they never accumulate alongside the growing fused buffers
-            clear_layer_caches()
+            for l in members:
+                drop_layer_runtime(l)
             mx.clear_cache()
     return n
 
@@ -537,6 +539,56 @@ def convert_engine(
     return errors
 
 
+def _install_mmap_embedding(
+    model: MlxLmModel,
+    model_dir: str,
+    src_key: str,
+    plain: dict[str, mx.array],
+    verbose: bool,
+) -> bool:
+    """Swap the skeleton's ``nn.Embedding`` for a host-mmap'd table.
+
+    ``src_key`` is the checkpoint key (pre-``sanitize``); ``plain`` is the
+    sanitized weight dict, from which the embedding weight is removed so
+    ``load_weights(strict=True)`` doesn't expect a slot for it. Returns
+    False (and leaves everything untouched) when disabled or not applicable.
+    """
+    import mlx.nn as nn
+
+    from ponyexl3.mlx.mmap_embedding import (
+        MmapEmbedding,
+        find_safetensors_tensor,
+        mmap_embedding_enabled,
+    )
+
+    if not mmap_embedding_enabled():
+        return False
+    dst_key = next((k for k in plain if k.endswith("embed_tokens.weight")), None)
+    if dst_key is None:
+        return False
+    path = dst_key[: -len(".weight")]
+    obj: Any = model
+    for p in path.split("."):
+        obj = obj[int(p)] if p.isdigit() else getattr(obj, p, None)
+        if obj is None:
+            return False
+    if type(obj) is not nn.Embedding:
+        return False
+    loc = find_safetensors_tensor(model_dir, src_key)
+    if loc is None:
+        return False
+    file, dtype, shape, offset = loc
+    try:
+        emb = MmapEmbedding(file, dtype, shape, offset)
+    except ValueError:
+        return False
+    _set_module(model, path, emb)
+    plain.pop(dst_key)
+    if verbose:
+        print(f"  embed_tokens: mmap {shape} {dtype} from {os.path.basename(file)} (not device-resident)")
+    return True
+
+
 def _apply_device_memory_limit() -> None:
     """Cap MLX memory to the GPU's recommended working set so the process
     never wires more than the OS allows. A 32 GB Mac kills the process at
@@ -561,6 +613,40 @@ def _apply_device_memory_limit() -> None:
         if env:
             print(
                 f"[warn] PONYEXL3_MEM_LIMIT_GB ignored: {exc}",
+                file=sys.stderr,
+            )
+    _apply_cache_limit()
+
+
+def _apply_cache_limit() -> None:
+    """Bound MLX's free-buffer cache so transient prefill buffers go back to
+    the OS instead of staying resident next to the weights.
+
+    MLX by default keeps every freed buffer for reuse. After a long prefill
+    that is ~2.5 GB of dead fp16 decode scratch on a 27B; on a 16 GB Mac that
+    is the difference between the weights staying paged-in and the first few
+    decode steps crawling while the OS swaps them back. Default is 10% of the
+    GPU's recommended working set (~1.3 GB on 16 GB, ~12 GB on 128 GB — no
+    change in behaviour on big machines). Override with
+    ``PONYEXL3_CACHE_LIMIT_GB=<n>``; ``0`` leaves MLX's default."""
+    env = os.environ.get("PONYEXL3_CACHE_LIMIT_GB", "").strip()
+    try:
+        if env:
+            gb = float(env)
+            if gb <= 0:
+                return
+            lim = int(gb * 1024**3)
+        else:
+            info = mx.device_info()
+            ws = int(info.get("max_recommended_working_set_size", 0))
+            if ws <= 0:
+                return
+            lim = int(ws * 0.10)
+        mx.set_cache_limit(lim)
+    except Exception as exc:
+        if env:
+            print(
+                f"[warn] PONYEXL3_CACHE_LIMIT_GB ignored: {exc}",
                 file=sys.stderr,
             )
 
@@ -627,11 +713,20 @@ def load_model(
             continue
         layer = _build_exl3_layer(key, info, weights)
         try:
+            mod = EXL3Linear(layer)
             _set_module(
                 model,
                 _module_path(key, language_model_wrapper=language_model_wrapper),
-                EXL3Linear(layer),
+                mod,
             )
+            if engine == "exl3":
+                # Drop the host numpy trellis now that the device runtime owns
+                # it, instead of after the whole build: holding both copies for
+                # every layer doubled the load transient (~14 GB for a 7 GB
+                # 2-bpw 27B — a swap storm on 16 GB Macs). Fused groups and
+                # monoliths are built from the device runtime, so nothing
+                # downstream needs the numpy. No-op under EXL3_WCACHE.
+                mod.release_source()
         except AttributeError:
             # No slot for this module in the model architecture — e.g. a separate
             # multi-token-prediction head bundled by an over-eager convert. Skip
@@ -662,7 +757,12 @@ def load_model(
         f"{key}.{sfx}" for key in storage for sfx in _EXL3_SUFFIXES
     }
     plain = {k: v for k, v in weights.items() if k not in exl3_tensor_keys}
+    # Optionally keep the (huge) token embedding table on disk and gather rows
+    # on demand instead of wiring ~2.5 GB of fp16 on the GPU (27B vocab 248k).
+    embed_src_key = next((k for k in plain if k.endswith("embed_tokens.weight")), None)
     plain = model.sanitize(plain)
+    if embed_src_key is not None:
+        _install_mmap_embedding(model, model_dir, embed_src_key, plain, verbose)
     plain = {
         k: v.astype(mx.float32 if k.endswith("A_log") else mx.float16)
         for k, v in plain.items()
@@ -695,9 +795,8 @@ def load_model(
 
         fused = fuse_exl3_siblings(model, model_type=model_type)
         if fused:
-            from ponyexl3.mlx.layer_state import clear_layer_caches
-
-            clear_layer_caches()
+            # (member runtimes are dropped inside fuse_exl3_siblings; the
+            # remaining layers' pins must survive — their numpy is gone)
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
             if verbose:
@@ -711,17 +810,14 @@ def load_model(
                 print(f"  mlp monolith {mono} layers")
 
         if engine == "exl3":
-            # Release the host-side numpy trellis now that the device runtime,
-            # fused groups, and monoliths own the weights. On unified memory it
-            # was dead weight competing with the KV cache (~4.6 GB / ~225k
-            # tokens of context on a 27B). No-op under EXL3_WCACHE.
-            released = 0
+            # The host-side numpy trellis was released per layer during the
+            # build (see the swap loop); this pass is a backstop that also
+            # re-pins every remaining exact linear's device runtime so the
+            # stripe / lm_head path resolves without the numpy. No-op under
+            # EXL3_WCACHE.
             for _, m in exl3_linears(model):
-                released += 1 if getattr(m._exl3, "trellis", None) is not None else 0
                 m.release_source()
             mx.clear_cache()
-            if verbose:
-                print(f"  released host trellis for {released} layers")
 
     if warm and engine == "exl3":
         for _, m in exl3_linears(model):

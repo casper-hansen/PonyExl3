@@ -87,10 +87,13 @@ class EXL3Linear(nn.Module):
         device runtime is pinned in the cache first so the stripe / lm_head
         path still resolves without re-deriving from it. No-op under
         ``EXL3_WCACHE`` (which reconstructs the fp16 ``W`` from the numpy)."""
-        if _WCACHE or getattr(self._exl3, "trellis", None) is None:
+        if _WCACHE:
             return self
         from ponyexl3.mlx.layer_state import pin_runtime
 
+        # Always (re-)pin: a blanket clear_layer_caches() elsewhere may have
+        # evicted the entry, and the stripe / lm_head path resolves the
+        # runtime through the cache, not through ``self._rt``.
         pin_runtime(self._exl3, self._rt)
         self._exl3.trellis = None
         return self

@@ -27,6 +27,7 @@ from ponyexl3.mlx.gemv_metal import (
     inner_gemv_had_mlx,
     inner_gemv_post_mlx,
 )
+from ponyexl3.mlx.layer_state import layer_runtime_mlx
 from ponyexl3.ref.codebook import codebook_mode_from_flags
 from ponyexl3.ref.layer import EXL3Layer
 from ponyexl3.ref.signs import unpack_signs_or_pass
@@ -104,8 +105,11 @@ class FusedEXL3Group(nn.Module):
         self.in_features = layers[0].in_features
         self._out_features = [l.out_features for l in layers]
 
-        self._trellis = mx.array(
-            np.concatenate([l.trellis for l in layers], axis=1).astype(np.uint16)
+        # Concatenate on device from each member's already-uploaded runtime
+        # trellis: no host-side copy of the group, and it works after the
+        # members' numpy source has been released (EXL3Linear.release_source).
+        self._trellis = mx.concatenate(
+            [layer_runtime_mlx(l).trellis.view(mx.uint16) for l in layers], axis=1
         )
         suh_rows = [unpack_signs_or_pass(l.suh) for l in layers]
         svh_rows = [unpack_signs_or_pass(l.svh) for l in layers]
@@ -129,6 +133,9 @@ class FusedEXL3Group(nn.Module):
 
         self._cache_x: mx.array | None = None
         self._cache_out: tuple[mx.array, ...] | None = None
+        # members that have already fetched the current cached output; once
+        # every member has, the entry is dropped (see ``cached``)
+        self._cache_served: set[int] = set()
 
     def _extra_repr(self) -> str:
         return f"members={self._keys}, k={self._k}"
@@ -205,7 +212,29 @@ class FusedEXL3Group(nn.Module):
         if self._cache_out is None or self._cache_x is not x:
             self._cache_out = self.forward_all(x)
             self._cache_x = x
+            self._cache_served.clear()
         return self._cache_out
+
+    def serve(self, x: mx.array, idx: int) -> mx.array:
+        """One member's share of the fused output for ``x``.
+
+        The group runs once per distinct input and hands each member its
+        slice. The entry is released as soon as every member has taken its
+        slice, instead of lingering until the next call: during prefill the
+        cached slices are (rows x sum(out_features)) fp16 per layer — ~4 GB
+        model-wide at a 512-token chunk, ~14 GB at 2048 — and holding them
+        across the whole forward was the dominant transient on 16 GB Macs.
+        A member fetching the same input twice just recomputes (rare; still
+        exact).
+        """
+        outs = self.cached(x)
+        y = outs[idx]
+        self._cache_served.add(idx)
+        if len(self._cache_served) >= len(self._out_features):
+            self._cache_out = None
+            self._cache_x = None
+            self._cache_served.clear()
+        return y
 
     def sibling(self, idx: int) -> "FusedEXL3Sibling":
         return FusedEXL3Sibling(self, idx)
@@ -225,7 +254,7 @@ class FusedEXL3Sibling(nn.Module):
         return f"{self._group._keys[self._idx]} (member {self._idx})"  # pyright: ignore[reportPrivateUsage]
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self._group.cached(x)[self._idx]
+        return self._group.serve(x, self._idx)
 
 
 class FusedPlainPair(nn.Module):
