@@ -185,16 +185,43 @@ def _fix_selector_keys(weights: dict[str, mx.array], model_cls: type) -> None:
                 weights[f"{key}.weight"] = weights.pop(key)
 
 
+# Prefix cache consulted by the prefill override below (set per call by
+# dflash2_stream_generate; the reference loop's signature has no slot for it).
+_ACTIVE_PREFIX_CACHE: Any | None = None
+_LAST_PREFILL_REUSED = 0
+
+
 def _pony_prefill_target(model: Any, prompt: mx.array, cache: Any, hidden_limit: int | None, step_size: int):
-    """Same contract as the reference ``_prefill_target`` but runs the target's
-    decoder only and applies ``lm_head`` to the final position. The reference
-    calls the full model per chunk, i.e. lm_head over 512 rows — on an EXL3
-    target that is the striped-decode path with a 2.5 GB fp16 lm_head cache."""
+    """Same contract as the reference ``_prefill_target`` but:
+
+    - runs the target's decoder only and applies ``lm_head`` to the final
+      position (the reference calls the full model per chunk, i.e. lm_head over
+      512 rows — on an EXL3 target that is the striped path with a 2.5 GB cache);
+    - with an active :class:`PrefixCache`, restores the longest exact-prefix
+      snapshot (target state + drafter aux-feature window) into ``cache`` and
+      prefills only the suffix, snapshotting at chunk boundaries.
+    """
+    global _LAST_PREFILL_REUSED
     if step_size <= 0:
         raise ValueError("prefill_step_size must be positive.")
     inner = model.model
+    pc = _ACTIVE_PREFIX_CACHE
+    ids = [int(t) for t in prompt.tolist()]
     hidden_chunks: list[mx.array] = []
     start = 0
+    _LAST_PREFILL_REUSED = 0
+    if pc is not None:
+        # keep at least the last token to prefill (we need fresh logits + h)
+        e = pc.lookup_entry(ids, max_len=len(ids) - 1)
+        if e is not None and e.aux is not None:
+            pc.restore_into(cache, e)
+            hidden_chunks = [e.aux]
+            start = len(e.tokens)
+            _LAST_PREFILL_REUSED = start
+            pc.hits += 1
+            pc.tokens_reused += start
+        else:
+            pc.misses += 1
     h = None
     while start < prompt.size:
         remaining = prompt.size - start
@@ -210,9 +237,14 @@ def _pony_prefill_target(model: Any, prompt: mx.array, cache: Any, hidden_limit:
         if end < prompt.size:
             mx.eval([c.state for c in cache], hidden_chunks[-1], h)
             mx.clear_cache()
+            if pc is not None and end % pc.every == 0:
+                pc.snapshot(ids[:end], cache, aux=mx.concatenate(hidden_chunks, axis=1))
         start = end
     hidden = hidden_chunks[0] if len(hidden_chunks) == 1 else mx.concatenate(hidden_chunks, axis=1)
     logits = model.lm_head(h[:, -1:])  # type: ignore[index]
+    if pc is not None:
+        mx.eval(logits, hidden, [c.state for c in cache])
+        pc.snapshot(ids, cache, logits, aux=hidden)
     return logits, hidden, prompt.size - hidden.shape[1]
 
 
@@ -237,18 +269,21 @@ def dflash2_stream_generate(
     prefill_chunk: int = 512,
     block_size: int | None = None,
     stats: GenStats | None = None,
+    prefix_cache: Any | None = None,
 ) -> Iterator[int]:
     """Yield token ids from the reference DFlash2 loop, filling ``stats``.
 
     The target is the wrapped PonyExl3 model (``model.language_model`` is what
     the reference sees as an mlx_lm model with ``.model.layers`` + ``lm_head``).
     """
+    global _ACTIVE_PREFIX_CACHE
     stats = stats if stats is not None else GenStats()
     stats.prompt_tokens = len(prompt_ids)
     lm = getattr(model, "language_model", model)
     hist: dict[int, int] = {}
     tic = time.perf_counter()
     first = True
+    _ACTIVE_PREFIX_CACHE = prefix_cache
     for resp in ref._stream_generate(  # pyright: ignore[reportPrivateUsage]
         lm,
         draft,
@@ -263,6 +298,8 @@ def dflash2_stream_generate(
     ):
         if first:
             stats.prefill_s = resp.prompt_tokens / resp.prompt_tps if resp.prompt_tps else 0.0
+            stats.prompt_reused = _LAST_PREFILL_REUSED
+            _ACTIVE_PREFIX_CACHE = None
             tic = time.perf_counter()
             first = False
         if resp.accepted is not None:
@@ -270,7 +307,13 @@ def dflash2_stream_generate(
             stats.spec_accepted += max(resp.accepted - 1, 0)  # accepted drafts (excl. bonus)
             stats.spec_drafted += (block_size or int(draft.config.block_size)) - 1
             hist[resp.accepted] = hist.get(resp.accepted, 0) + 1
+        eos_ids = getattr(tokenizer, "eos_token_ids", None) or set()
         for t in resp.tokens:
+            if t in eos_ids:
+                # the reference includes the terminal EOS in ``tokens``; keep
+                # it out of the yielded text like the other generate paths
+                stats.finish_reason = "stop"
+                break
             stats.gen_tokens += 1
             yield t
         if resp.finish_reason:

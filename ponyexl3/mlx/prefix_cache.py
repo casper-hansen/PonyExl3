@@ -37,6 +37,7 @@ class _Entry:
     states: list[Any]  # per-layer cache.state
     logits: mx.array | None  # next-token logits at this position (if known)
     bytes: int
+    aux: mx.array | None = None  # drafter aux features window (DFlash2), (1, W, 5*H)
 
 
 def _state_bytes(states: list[Any]) -> int:
@@ -74,8 +75,19 @@ class PrefixCache:
     def bytes(self) -> int:
         return sum(e.bytes for e in self._entries.values())
 
-    def snapshot(self, tokens: list[int], cache: list[Any], logits: mx.array | None = None) -> None:
-        """Record ``cache``'s current state as the state after ``tokens``."""
+    def snapshot(
+        self,
+        tokens: list[int],
+        cache: list[Any],
+        logits: mx.array | None = None,
+        *,
+        aux: mx.array | None = None,
+    ) -> None:
+        """Record ``cache``'s current state as the state after ``tokens``.
+
+        ``aux`` (optional) is the DFlash2 drafter's context-feature window at
+        this position, so the speculative path can resume without recomputing
+        target hidden states for the reused prefix."""
         key = tuple(tokens)
         states = [c.state for c in cache]
         if logits is not None:
@@ -83,11 +95,29 @@ class PrefixCache:
         mx.eval(*[a for st in states for a in (st if isinstance(st, (list, tuple)) else [st]) if isinstance(a, mx.array)])
         if logits is not None:
             mx.eval(logits)
+        if aux is not None:
+            mx.eval(aux)
         if key in self._entries:
             self._entries.move_to_end(key)
-        self._entries[key] = _Entry(key, states, logits, _state_bytes(states))
+        nbytes = _state_bytes(states) + (aux.nbytes if aux is not None else 0)
+        self._entries[key] = _Entry(key, states, logits, nbytes, aux)
         while len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)
+
+    def lookup_entry(self, tokens: list[int], *, max_len: int | None = None) -> _Entry | None:
+        """Longest snapshot that is an exact prefix of ``tokens`` (len <= max_len)."""
+        best: _Entry | None = None
+        for key, e in self._entries.items():
+            if len(key) <= len(tokens) and (max_len is None or len(key) <= max_len):
+                if _common_prefix(key, tokens) == len(key) and (best is None or len(key) > len(best.tokens)):
+                    best = e
+        if best is not None:
+            self._entries.move_to_end(best.tokens)
+        return best
+
+    def restore_into(self, cache: list[Any], entry: _Entry) -> None:
+        for c, st in zip(cache, entry.states):
+            c.state = st
 
     def lookup(self, tokens: list[int]) -> tuple[list[Any], int, mx.array | None] | None:
         """Longest snapshot that is an exact prefix of ``tokens`` (may equal it).

@@ -1123,6 +1123,7 @@ def generate_text(
             temp=temp,
             prefill_chunk=prefill_chunk,
             stats=stats,
+            prefix_cache=prefix_cache,
         )
     elif dflash is not None:
         gen = dflash_stream_generate(
