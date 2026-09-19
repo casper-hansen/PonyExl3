@@ -277,11 +277,18 @@ def load_generate_stack(args: argparse.Namespace) -> GenerateStack:
         from ponyexl3.mlx.dflash2 import load_dflash2
 
         bits = None if args.dflash2_bits == "16" else int(args.dflash2_bits)
-        dflash2 = load_dflash2(args.dflash2, bits=bits, verbose=not args.quiet)
+        dflash2 = load_dflash2(
+            args.dflash2,
+            bits=bits,
+            verbose=not args.quiet,
+            draft_head_bits=4 if args.draft_w4 else None,
+            draft_head_cache_dir=args.model,
+        )
         if not args.quiet:
             print(
                 f"[dflash2] drafter loaded (block {dflash2.config.block_size}, "
-                f"{'bf16' if bits is None else f'w{bits}'} body) — speculative decoding on",
+                f"{'bf16' if bits is None else f'w{bits}'} body"
+                + (", w4 draft head" if args.draft_w4 else "") + ") — speculative decoding on",
                 file=sys.stderr,
             )
         # the other drafters are mutually exclusive with dflash2

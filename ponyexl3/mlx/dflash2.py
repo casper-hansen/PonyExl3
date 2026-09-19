@@ -92,8 +92,14 @@ def load_dflash2(
     bits: int | None = 4,
     group_size: int = 64,
     verbose: bool = False,
+    draft_head_bits: int | None = None,
+    draft_head_cache_dir: str | os.PathLike[str] | None = None,
 ) -> ref.DFlashDraftModel:
     """Load a DFlash / DFlash2 drafter from ``draft_dir``.
+
+    ``draft_head_bits`` (4/8) swaps the drafter's copy of the target lm_head
+    for an affine-quantized one (cached under ``draft_head_cache_dir``, normally
+    the target model dir); proposals may differ slightly, output cannot.
 
     ``bits=None`` keeps the bf16 body. Otherwise the body linears are affine
     requantized and cached at ``<draft_dir>/.pony_cache/body_w{bits}g{gs}.safetensors``;
@@ -106,6 +112,8 @@ def load_dflash2(
     model = model_cls(config)
     model.eval()
     model.bind = types.MethodType(_bind_to_pony_target, model)  # type: ignore[method-assign]
+    model._pony_head_bits = draft_head_bits
+    model._pony_head_cache_dir = None if draft_head_cache_dir is None else str(draft_head_cache_dir)
 
     shards = sorted(path.glob("*.safetensors"))
     if not shards:
@@ -173,8 +181,37 @@ def _bind_to_pony_target(draft: ref.DFlashDraftModel, target_model: Any) -> ref.
         head = getattr(lm, "lm_head", None)
     if head is None:
         raise AttributeError("target has no lm_head")
+    bits = getattr(draft, "_pony_head_bits", None)
+    exl3 = getattr(head, "_exl3", None)
+    if bits and exl3 is not None:
+        # Drafter-side logits only feed candidate selection (verification uses
+        # the exact target head), so an affine w4 copy is a pure speed lever:
+        # 26 ms -> ~5 ms per cycle for the 8-row 248k-vocab head on M2 Pro.
+        from ponyexl3.mlx.native import quantized_linear_cached
+
+        cache_dir = getattr(draft, "_pony_head_cache_dir", None)
+        if cache_dir is not None:
+            ql = quantized_linear_cached(
+                exl3, os.path.join(cache_dir, ".pony_cache", f"draft_head_w{bits}g64.safetensors"), bits=bits, group_size=64
+            )
+        else:
+            from ponyexl3.mlx.native import quantized_linear_from_exl3
+
+            ql = quantized_linear_from_exl3(exl3, bits=bits, group_size=64)
+        head = _Fp16Head(ql)
     draft.lm_head = head
     return draft
+
+
+class _Fp16Head(nn.Module):
+    """Run a fp16-scaled QuantizedLinear on bf16 drafter hidden states."""
+
+    def __init__(self, ql: nn.Module):
+        super().__init__()
+        self.ql = ql
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.ql(x.astype(mx.float16))
 
 
 def _fix_selector_keys(weights: dict[str, mx.array], model_cls: type) -> None:
